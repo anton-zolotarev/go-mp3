@@ -91,35 +91,72 @@ func (d *Decoder) Seek(offset int64, whence int) (int64, error) {
 	default:
 		return 0, errors.New("mp3: invalid whence")
 	}
+	if npos < 0 {
+		return 0, errors.New("mp3: negative position")
+	}
 	d.pos = npos
 	d.buf = nil
 	d.frame = nil
 	f := d.pos / d.bytesPerFrame
-	// If the frame is not first, read the previous ahead of reading that
-	// because the previous frame can affect the targeted frame.
-	if f > 0 {
-		f--
-		if _, err := d.source.Seek(d.frameStarts[f], 0); err != nil {
-			return 0, err
-		}
+	if f >= int64(len(d.frameStarts)) {
+		// At the end or past it: nothing to decode; Read gives io.EOF.
+		return npos, nil
+	}
+	from := d.warmUpFrom(f)
+	if _, err := d.source.Seek(d.frameStarts[from], 0); err != nil {
+		return 0, err
+	}
+	for i := from; i <= f; i++ {
 		if err := d.readFrame(); err != nil {
+			if err == io.EOF {
+				break
+			}
 			return 0, err
 		}
-		if err := d.readFrame(); err != nil {
-			return 0, err
-		}
-		d.buf = d.buf[d.bytesPerFrame+(d.pos%d.bytesPerFrame):]
+	}
+	skip := (f-from)*d.bytesPerFrame + d.pos%d.bytesPerFrame
+	if skip >= int64(len(d.buf)) {
+		d.buf = nil // (fewer frames than counted: the end)
 	} else {
-		if _, err := d.source.Seek(d.frameStarts[f], 0); err != nil {
-			return 0, err
-		}
-		if err := d.readFrame(); err != nil {
-			return 0, err
-		}
-		d.buf = d.buf[d.pos:]
+		d.buf = d.buf[skip:]
 	}
 	return npos, nil
 }
+
+// warmUpFrom is the frame Seek starts decoding at to get frame f right.
+//
+// A frame's samples depend on the frames before it: its first granule
+// overlaps the last granule of the frame before, and its main data may
+// begin up to 511 bytes back in theirs (the bit reservoir; 255 in MPEG-2).
+// So the frame before f has to come out right as well, and for that the
+// decoder needs that much main data before it: those frames are decoded
+// and dropped (the first of them without its own reservoir — its data
+// still serves the next). One frame was not enough: at a low bit rate 511
+// bytes span several.
+func (d *Decoder) warmUpFrom(f int64) int64 {
+	if f == 0 {
+		return 0
+	}
+	from := f - 1 // the frame before: right, for the overlap
+	for need := int64(maxMainDataBegin); from > 0 && need > 0; {
+		from--
+		size := d.frameStarts[from+1] - d.frameStarts[from]
+		main := size - frameOverhead // (its main data: no header or side info)
+		if main < size/4 {
+			main = size / 4 // (tiny frames, whose overhead is smaller: still a step)
+		}
+		need -= main
+	}
+	return from
+}
+
+const (
+	// maxMainDataBegin is how far back a frame's main data may begin (9 bits).
+	maxMainDataBegin = 511
+	// frameOverhead is the most of a frame that is not main data: header
+	// (4), CRC (2), side info (32 in MPEG-1 stereo, the largest).
+	frameOverhead = 38
+)
 
 // SampleRate returns the sample rate like 44100.
 //
